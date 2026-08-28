@@ -10,7 +10,7 @@ authors:
 license: MIT
 version: 2.0.0
 date-released: "2026-08-27"
-repository-code: "https://github.com/cemilsimsek/ecs-dss"
+repository-code: "https://github.com/cemilsimsekmail-rgb/ecs-dss"
 preferred-citation:
   type: article
   title: "A Decision Support System for Risk-Constrained Examination Center
