@@ -48,7 +48,7 @@ infeasible once the mandatory set grows and clusters geographically.
 ## Installation
 
 ```bash
-git clone https://github.com/cemilsimsek/ecs-dss.git
+git clone https://github.com/cemilsimsekmail-rgb/ecs-dss.git
 cd ecs-dss
 pip install -r requirements.txt
 ```
