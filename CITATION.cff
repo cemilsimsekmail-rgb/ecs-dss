@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+title: "ECS-DSS: Examination Center Selection Decision Support System"
+message: "If you use this software, please cite the accompanying article."
+type: software
+authors:
+  - family-names: Simsek
+    given-names: Cemil
+    orcid: "https://orcid.org/0009-0004-3256-2806"
+    affiliation: "Gendarmerie and Coast Guard Academy, Ankara, Turkiye"
+license: MIT
+version: 2.0.0
+date-released: "2026-08-27"
+repository-code: "https://github.com/cemilsimsek/ecs-dss"
+preferred-citation:
+  type: article
+  title: "A Decision Support System for Risk-Constrained Examination Center
+    Selection Under a Coverage Requirement"
+  authors:
+    - family-names: Simsek
+      given-names: Cemil
+      orcid: "https://orcid.org/0009-0004-3256-2806"
+  journal: "IEEE Access"
+  year: 2026
