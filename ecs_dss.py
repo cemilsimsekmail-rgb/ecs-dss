@@ -25,8 +25,18 @@ Model (equation numbers follow the article):
 
 Proposition 1: q >= V always, hence K = max{N, q}; V never binds alone.
 
-Requirements:  pip install pulp numpy matplotlib
-               tkinter (python3-tk on Debian/Ubuntu)
+Lexicographic travel stage (15): with Z* the optimum of (1)-(7),
+    min sum_ij P_i d_ij y_ij  s.t. (2)-(7) and sum_i P_i y_ii = Z*.
+
+Extensions added in v2.1 (Section III-G of the article):
+    capacity (16):   sum_i P_i y_ij <= C_j x_j          for all j
+    elastic (17)-(19): penalty variables u_i >= sum_j (d_ij - M)^+ y_ij
+                     admit assignments beyond M at a lexicographically
+                     dominant penalty, giving a best-effort plan when no
+                     plan with K centers satisfies the travel limit.
+
+Requirements:  pip install -r requirements.txt   (PuLP 2.x, NumPy, Matplotlib)
+               tkinter (python3-tk on Debian/Ubuntu) for the GUI only
 Data:          data.json next to this file
 Usage:         python ecs_dss.py
 
@@ -43,25 +53,50 @@ import queue
 import sys
 import threading
 import time
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 
 try:
     import pulp
 except ImportError:
-    sys.exit("PuLP is required:  pip install pulp")
+    sys.exit("PuLP is required:  pip install -r requirements.txt")
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.patches import Polygon
 
-APP_TITLE = "Examination Center Selection - Decision Support System v2.0"
+# The graphical interface is optional: --cli runs without Tk.
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    _TkBase = tk.Tk
+except ImportError:          # headless installation
+    tk = None
+    _TkBase = object
+
+APP_TITLE = "Examination Center Selection - Decision Support System v2.1"
+
+
+def _binaries(name, keys):
+    """Dictionary of binary variables. Uses LpVariable.dicts where PuLP
+    provides it (2.x, the version used for the published results) and an
+    equivalent explicit construction otherwise."""
+    if hasattr(pulp.LpVariable, "dicts"):
+        return pulp.LpVariable.dicts(name, keys, cat="Binary")
+    out = {}
+    for k in keys:
+        tag = "_".join(map(str, k)) if isinstance(k, tuple) else str(k)
+        out[k] = pulp.LpVariable(f"{name}_{tag}", cat="Binary")
+    return out
+
+
+def _solve(model):
+    model.solve(pulp.PULP_CBC_CMD(msg=False))
+    return pulp.LpStatus[model.status] == "Optimal"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 INK, ACC, ALERT, GOOD, MUTED = "#1f2933", "#1f4e79", "#c00000", "#2e7d32", "#7a8a99"
@@ -262,29 +297,85 @@ class RiskModel:
 class Optimizer:
     def __init__(self, data):
         self.d = data
+        self._cov = {}
 
-    def covering_minimum(self, M=250, forced=()):
-        """Equation (9)."""
+    # -- helpers ------------------------------------------------------------
+    def _cover_sets(self, M):
+        """For each province i, the set of candidate centres within M km."""
+        if M not in self._cov:
+            self._cov[M] = {i: frozenset(self.d.neighbours(i, M))
+                            for i in self.d.I}
+        return self._cov[M]
+
+    def covers(self, centres, M=250):
+        cov, c = self._cover_sets(M), set(centres)
+        return all(cov[i] & c for i in self.d.I)
+
+    @staticmethod
+    def _cap(cap, j):
+        if cap is None:
+            return None
+        return cap[j] if isinstance(cap, dict) else cap
+
+    def nearest_assignment(self, centres):
+        """Uncapacitated travel-minimal assignment of a fixed centre set."""
+        d = self.d
+        return {i: min(centres, key=lambda j: (d.D[(i, j)], j)) for i in d.I}
+
+    def metrics(self, centres, assign, forced=(), M=250):
+        """Common performance measures of a plan."""
+        d = self.d
+        local = sum(d.P[i] for i in d.I if assign[i] == i)
+        over = [i for i in d.I if d.D[(i, assign[i])] > M]
+        return dict(
+            centres=sorted(centres), assign=assign, Z=local,
+            rate=local / d.total,
+            pkm=sum(d.P[i] * d.D[(i, assign[i])] for i in d.I),
+            load={j: sum(d.P[i] for i in d.I if assign[i] == j)
+                  for j in centres},
+            maxdist=max(d.D[(i, assign[i])] for i in d.I),
+            violations=over, violating_personnel=sum(d.P[i] for i in over),
+            # personnel of mandatory provinces who must leave them
+            hr_travel=sum(d.P[i] for i in forced if assign[i] != i))
+
+    # -- covering minimum ---------------------------------------------------
+    def covering_minimum(self, M=250, forced=(), cap=None):
+        """Equation (9). With a capacity vector the minimum is taken over
+        centre sets that admit a capacity-feasible assignment (q_C)."""
         d = self.d
         m = pulp.LpProblem("cover", pulp.LpMinimize)
-        x = pulp.LpVariable.dicts("x", d.I, cat="Binary")
+        x = _binaries("x", d.I)
         m += pulp.lpSum(x[j] for j in d.I)
-        for i in d.I:
-            m += pulp.lpSum(x[j] for j in d.neighbours(i, M)) >= 1
+        if cap is None:
+            for i in d.I:
+                m += pulp.lpSum(x[j] for j in d.neighbours(i, M)) >= 1
+        else:
+            pairs = [(i, j) for i in d.I for j in d.neighbours(i, M)]
+            y = _binaries("y", pairs)
+            for i in d.I:
+                m += pulp.lpSum(y[(i, j)] for j in d.neighbours(i, M)) == 1
+            for i, j in pairs:
+                m += y[(i, j)] <= x[j]
+            for j in d.I:
+                m += pulp.lpSum(d.P[i] * y[(i, j)] for i in d.I
+                                if (i, j) in y) <= self._cap(cap, j) * x[j]
         for j in forced:
             m += x[j] == 1
-        m.solve(pulp.PULP_CBC_CMD(msg=False))
+        if not _solve(m):
+            return None
         return int(round(pulp.value(m.objective)))
 
-    def solve(self, K, M=250, forced=(), lexicographic=True):
-        """Model (1)-(7). The second stage minimises total travel among the
-        optimal solutions so that reported distances are well defined."""
+    # -- main model -----------------------------------------------------------
+    def solve(self, K, M=250, forced=(), lexicographic=True, cap=None):
+        """Model (1)-(7), optionally with capacity (16). The second stage (15)
+        minimises total travel among the optimal solutions so that reported
+        distances are well defined."""
         d = self.d
         t0 = time.time()
         m = pulp.LpProblem("ECS", pulp.LpMaximize)
-        x = pulp.LpVariable.dicts("x", d.I, cat="Binary")
+        x = _binaries("x", d.I)
         pairs = [(i, j) for i in d.I for j in d.neighbours(i, M)]
-        y = pulp.LpVariable.dicts("y", pairs, cat="Binary")
+        y = _binaries("y", pairs)
 
         m += pulp.lpSum(d.P[i] * y[(i, i)] for i in d.I)
         for i in d.I:
@@ -294,18 +385,22 @@ class Optimizer:
         for j in forced:
             m += x[j] == 1
         m += pulp.lpSum(x[j] for j in d.I) == K
+        if cap is not None:
+            for j in d.I:
+                m += pulp.lpSum(d.P[i] * y[(i, j)] for i in d.I
+                                if (i, j) in y) <= self._cap(cap, j) * x[j]
 
-        m.solve(pulp.PULP_CBC_CMD(msg=False))
-        if pulp.LpStatus[m.status] != "Optimal":
+        if not _solve(m):
             return None
         Z = int(round(pulp.value(m.objective)))
+        t1 = time.time() - t0
 
         if lexicographic:
             m += pulp.lpSum(d.P[i] * y[(i, i)] for i in d.I) == Z
             m.sense = pulp.LpMinimize
             m.setObjective(pulp.lpSum(d.P[i] * d.D[(i, j)] * y[(i, j)]
                                       for i, j in pairs))
-            m.solve(pulp.PULP_CBC_CMD(msg=False))
+            _solve(m)
 
         centres = sorted(j for j in d.I if pulp.value(x[j]) > 0.5)
         assign = {i: j for i, j in pairs if pulp.value(y[(i, j)]) > 0.5}
@@ -315,19 +410,99 @@ class Optimizer:
                     load={j: sum(d.P[i] for i in d.I if assign[i] == j)
                           for j in centres},
                     maxdist=max(d.D[(i, assign[i])] for i in d.I),
-                    nvar=len(d.I) + len(pairs), cpu=time.time() - t0)
+                    hr_travel=sum(d.P[i] for i in forced if assign[i] != i),
+                    nvar=len(d.I) + len(pairs), cpu=time.time() - t0,
+                    cpu_stage1=t1)
 
-    def solve_policy(self, N=17, M=250, forced=()):
-        """Cardinality rule (10)."""
-        V, q = len(forced), self.covering_minimum(M, forced)
+    def solve_policy(self, N=17, M=250, forced=(), cap=None):
+        """Cardinality rule (10); with capacity, q is replaced by q_C."""
+        V, q = len(forced), self.covering_minimum(M, forced, cap)
+        if q is None:
+            return None
         K = max(N, V, q)
-        r = self.solve(K, M, forced)
+        r = self.solve(K, M, forced, cap=cap)
         if r is not None:
             driver = ("Budget = coverage" if K == N == q
                       else "Budget" if K == N else "Coverage")
             r.update(N=N, V=V, q=q, driver=driver)
         return r
 
+    # -- elastic (best-effort) model ------------------------------------------
+    def elastic(self, K, M=250, forced=(), cap=None):
+        """Best-effort variant (17)-(19) for a hard budget K.
+
+        Every pair (i, j) is admissible; the penalty variable u_i records by
+        how many kilometres the assignment of province i exceeds M:
+            u_i >= sum_j (d_ij - M)^+ y_ij,   u_i >= 0.
+        The penalised objective  max sum_i P_i y_ii - lam * sum_i P_i u_i
+        with lam > sum_i P_i is equivalent to the lexicographic order
+        (minimise excess personnel-km first, then maximise Z), which is how it
+        is solved here to avoid large coefficients. A third stage minimises
+        total travel. When a plan satisfying the limit exists, the penalty is
+        zero and the result coincides with model (1)-(7)."""
+        d = self.d
+        t0 = time.time()
+        pairs = [(i, j) for i in d.I for j in d.I]
+        exc = {(i, j): max(0, d.D[(i, j)] - M) for i, j in pairs}
+        m = pulp.LpProblem("ECS_elastic", pulp.LpMinimize)
+        x = _binaries("x", d.I)
+        y = _binaries("y", pairs)
+        u = {i: pulp.LpVariable(f"u_{i}", lowBound=0) for i in d.I}
+        for i in d.I:
+            m += pulp.lpSum(y[(i, j)] for j in d.I) == 1
+            m += u[i] >= pulp.lpSum(exc[(i, j)] * y[(i, j)] for j in d.I
+                                    if exc[(i, j)] > 0)
+            for j in d.I:
+                m += y[(i, j)] <= x[j]
+        for j in forced:
+            m += x[j] == 1
+        m += pulp.lpSum(x[j] for j in d.I) == K
+        if cap is not None:
+            for j in d.I:
+                m += pulp.lpSum(d.P[i] * y[(i, j)] for i in d.I) \
+                    <= self._cap(cap, j) * x[j]
+        penalty = pulp.lpSum(d.P[i] * u[i] for i in d.I)
+        local = pulp.lpSum(d.P[i] * y[(i, i)] for i in d.I)
+        travel = pulp.lpSum(d.P[i] * d.D[(i, j)] * y[(i, j)] for i, j in pairs)
+
+        m.setObjective(penalty)                       # stage 1
+        if not _solve(m):
+            return None
+        E = int(round(pulp.value(penalty)))
+        m += penalty <= E
+        m.sense = pulp.LpMaximize                     # stage 2
+        m.setObjective(local)
+        _solve(m)
+        Z = int(round(pulp.value(local)))
+        m += local >= Z
+        m.sense = pulp.LpMinimize                     # stage 3
+        m.setObjective(travel)
+        _solve(m)
+
+        centres = sorted(j for j in d.I if pulp.value(x[j]) > 0.5)
+        assign = {i: j for i, j in pairs if pulp.value(y[(i, j)]) > 0.5}
+        r = self.metrics(centres, assign, forced, M)
+        r.update(K=K, M=M, excess_pkm=E, cpu=time.time() - t0)
+        return r
+
+    def lp_bound(self, K, M=250, forced=()):
+        """Optimal value of the linear relaxation of (1)-(7)."""
+        d = self.d
+        m = pulp.LpProblem("ECS_LP", pulp.LpMaximize)
+        x = {j: pulp.LpVariable(f"x_{j}", 0, 1) for j in d.I}
+        pairs = [(i, j) for i in d.I for j in d.neighbours(i, M)]
+        y = {p: pulp.LpVariable(f"y_{p[0]}_{p[1]}", 0, 1) for p in pairs}
+        m += pulp.lpSum(d.P[i] * y[(i, i)] for i in d.I)
+        for i in d.I:
+            m += pulp.lpSum(y[(i, j)] for j in d.neighbours(i, M)) == 1
+            for j in d.neighbours(i, M):
+                m += y[(i, j)] <= x[j]
+        for j in forced:
+            m += x[j] == 1
+        m += pulp.lpSum(x.values()) == K
+        return pulp.value(m.objective) if _solve(m) else None
+
+    # -- diagnostics ----------------------------------------------------------
     def criticality(self, centres, M=250):
         """Which provinces are stranded when each centre is removed."""
         d = self.d
@@ -357,63 +532,103 @@ class Optimizer:
                     violating_personnel=sum(d.P[i] for i in over),
                     maxdist=max(d.D[(i, a[i])] for i in d.I))
 
-    # -- benchmarks ---------------------------------------------------------
-    def pmedian(self, K=17, M=250):
+    # -- benchmarks -----------------------------------------------------------
+    # Every benchmark receives the same K, M and mandatory set as the
+    # proposed model. Plans are evaluated with the nearest-open-centre
+    # assignment, which is the travel-minimal assignment of a fixed set.
+    def pmedian(self, K=17, M=250, forced=()):
         d = self.d
         t0 = time.time()
         m = pulp.LpProblem("pmed", pulp.LpMinimize)
-        x = pulp.LpVariable.dicts("x", d.I, cat="Binary")
+        x = _binaries("x", d.I)
         pairs = [(i, j) for i in d.I for j in d.neighbours(i, M)]
-        y = pulp.LpVariable.dicts("y", pairs, cat="Binary")
+        y = _binaries("y", pairs)
         m += pulp.lpSum(d.P[i] * d.D[(i, j)] * y[(i, j)] for i, j in pairs)
         for i in d.I:
             m += pulp.lpSum(y[(i, j)] for j in d.neighbours(i, M)) == 1
             for j in d.neighbours(i, M):
                 m += y[(i, j)] <= x[j]
+        for j in forced:
+            m += x[j] == 1
         m += pulp.lpSum(x[j] for j in d.I) == K
-        m.solve(pulp.PULP_CBC_CMD(msg=False))
+        if not _solve(m):
+            return None
+        cpu = time.time() - t0
         a = {i: j for i, j in pairs if pulp.value(y[(i, j)]) > 0.5}
-        Z = sum(d.P[i] for i in d.I if a[i] == i)
-        return dict(Z=Z, rate=Z / d.total,
-                    pkm=sum(d.P[i] * d.D[(i, a[i])] for i in d.I),
-                    centres=sorted(j for j in d.I if pulp.value(x[j]) > 0.5),
-                    cpu=time.time() - t0)
+        c = sorted(j for j in d.I if pulp.value(x[j]) > 0.5)
+        r = self.metrics(c, a, forced, M)
+        r.update(cpu=cpu, feasible=True)
+        return r
 
-    def mclp(self, K=17, radius=250):
+    def mclp(self, K=17, radius=250, forced=()):
+        """Maximal covering location problem. At this radius the covering
+        objective is flat over a very large family of centre sets; the set
+        reported is the one returned by CBC."""
         d = self.d
         t0 = time.time()
         m = pulp.LpProblem("mclp", pulp.LpMaximize)
-        x = pulp.LpVariable.dicts("x", d.I, cat="Binary")
-        z = pulp.LpVariable.dicts("z", d.I, cat="Binary")
+        x = _binaries("x", d.I)
+        z = _binaries("z", d.I)
         m += pulp.lpSum(d.P[i] * z[i] for i in d.I)
         for i in d.I:
             m += pulp.lpSum(x[j] for j in d.neighbours(i, radius)) >= z[i]
+        for j in forced:
+            m += x[j] == 1
         m += pulp.lpSum(x[j] for j in d.I) == K
-        m.solve(pulp.PULP_CBC_CMD(msg=False))
+        if not _solve(m):
+            return None
+        cpu = time.time() - t0
         c = sorted(j for j in d.I if pulp.value(x[j]) > 0.5)
-        Z = sum(d.P[j] for j in c)
-        return dict(Z=Z, rate=Z / d.total, centres=c, cpu=time.time() - t0)
+        r = self.metrics(c, self.nearest_assignment(c), forced, radius)
+        r.update(cpu=cpu, feasible=True,
+                 covered=int(round(pulp.value(m.objective))))
+        return r
 
     def greedy(self, K=17, M=250, forced=()):
-        """Greedy coverage repair followed by one-swap local search."""
+        """Greedy coverage repair followed by one-swap local search.
+
+        Construction: starting from the mandatory set, repeatedly open the
+        centre covering the most uncovered personnel until every province is
+        within M; if this produces more than K centres, close non-mandatory
+        centres (smallest home cohort first) whose removal keeps coverage;
+        then fill up to K by home cohort. Improvement: first-improvement
+        one-swap search on the home cohort subject to coverage. Returns
+        feasible=False when no K-centre cover is reached."""
         d = self.d
         t0 = time.time()
+        cov = self._cover_sets(M)
+        fset = set(forced)
+
+        checks = [0]
 
         def feasible(c):
-            return all(any(d.D[(i, j)] <= M for j in c) for i in d.I)
+            checks[0] += 1
+            return all(cov[i] & c for i in d.I)
 
         cur = set(forced)
         while not feasible(cur):
-            unc = [i for i in d.I if not any(d.D[(i, j)] <= M for j in cur)]
+            unc = [i for i in d.I if not cov[i] & cur]
             cur.add(max((j for j in d.I if j not in cur),
                         key=lambda j: sum(d.P[i] for i in unc
                                           if d.D[(i, j)] <= M)))
+        # Cardinality repair (added in v2.1): the greedy cover may exceed K.
+        dropped = True
+        while len(cur) > K and dropped:
+            dropped = False
+            for j in sorted(cur - fset, key=lambda j: (d.P[j], j)):
+                if feasible(cur - {j}):
+                    cur.discard(j)
+                    dropped = True
+                    break
+        if len(cur) > K:
+            return dict(feasible=False, size=len(cur), checks=checks[0],
+                        cpu=time.time() - t0)
         while len(cur) < K:
             cur.add(max((j for j in d.I if j not in cur), key=lambda j: d.P[j]))
         improved = True
         while improved:
             improved = False
-            for out in list(cur - set(forced)):
+            for out in list(cur - fset):
                 for inn in (j for j in d.I if j not in cur):
                     trial = (cur - {out}) | {inn}
                     if feasible(trial) and \
@@ -422,17 +637,64 @@ class Optimizer:
                         break
                 if improved:
                     break
-        Z = sum(d.P[j] for j in cur)
-        return dict(Z=Z, rate=Z / d.total, centres=sorted(cur),
-                    cpu=time.time() - t0)
+        cpu = time.time() - t0
+        c = sorted(cur)
+        r = self.metrics(c, self.nearest_assignment(c), forced, M)
+        r.update(cpu=cpu, feasible=True, checks=checks[0])
+        return r
+
+    def sequential(self, K=17, M=250, forced=(), base=None):
+        """Risk-blind optimisation followed by post-hoc insertion of the
+        mandatory provinces, the way a risk requirement is typically
+        accommodated when it is not part of the model: each mandatory
+        province (highest risk first, i.e. in the order given) replaces the
+        non-mandatory centre whose removal keeps coverage and loses the
+        smallest home cohort. feasible=False if some insertion admits no
+        coverage-preserving swap."""
+        d = self.d
+        t0 = time.time()
+        if base is None:
+            base = self.solve(K, M)["centres"]
+        cur, fixed = set(base), set()
+        for h in forced:
+            fixed.add(h)
+            if h in cur:
+                continue
+            best = None
+            for out in sorted(cur - fixed, key=lambda j: (d.P[j], j)):
+                if self.covers((cur - {out}) | {h}, M):
+                    best = out
+                    break
+            if best is None:
+                return dict(feasible=False, cpu=time.time() - t0)
+            cur = (cur - {best}) | {h}
+        cpu = time.time() - t0
+        c = sorted(cur)
+        r = self.metrics(c, self.nearest_assignment(c), forced, M)
+        r.update(cpu=cpu, feasible=True)
+        return r
+
+    def risk_blind(self, K=17, M=250, forced=()):
+        """Model (1)-(7) without constraint (5); the mandatory set is used
+        only to measure how many high-risk personnel would have to leave."""
+        r = self.solve(K, M)
+        r["hr_travel"] = sum(self.d.P[i] for i in forced
+                             if r["assign"][i] != i)
+        return r
 
 
 # ---------------------------------------------------------------------------
 # Study
 # ---------------------------------------------------------------------------
 class Study:
-    TABLES = ["Table 1", "Table 2", "Table 3", "Table 4", "Table 5",
-              "Table 6", "Table 7", "Table 8", "Table 9", "Full risk table"]
+    # Numbering follows the article (Table 1 is the literature comparison,
+    # which is not computed).
+    TABLES = ["Table 2", "Table 3", "Table 4", "Table 5", "Table 6",
+              "Table 7", "Table 8", "Table 9", "Table 10", "Table 11",
+              "Table 12", "Table 13", "Full risk table"]
+    CAPACITIES = (None, 6000, 5000, 4500, 4000, 3500)
+    BENCH_V = (2, 5, 8, 10)
+    ELASTIC_V = (0, 8, 10, 12, 15)
     FIGURES = ["Figure 1 - System architecture",
                "Figure 2 - Selected centers (map)",
                "Figure 3 - V > N regime",
@@ -543,11 +805,12 @@ class Study:
 
         say("Sweeping the distance threshold ...")
         msweep = []
-        for mm in (200, 225, 250, 275, 300, 350, 400):
+        for mm in (150, 175, 200, 225, 250, 275, 300, 350, 400):
             r = opt.solve(N, mm)
             msweep.append(dict(M=mm, q=opt.covering_minimum(mm),
                                Z=r["Z"] if r else None,
-                               rate=r["rate"] if r else None))
+                               rate=r["rate"] if r else None,
+                               pkm=r["pkm"] if r else None))
 
         say("Sweeping the risk threshold ...")
         rsweep = []
@@ -559,7 +822,45 @@ class Study:
 
         say("Running benchmarks ...")
         bench = dict(proposed=s1, pmedian=opt.pmedian(N, M),
-                     mclp=opt.mclp(N, M), greedy=opt.greedy(N, M))
+                     mclp=opt.mclp(N, M), greedy=opt.greedy(N, M),
+                     lp=opt.lp_bound(s1["K"], M))
+
+        say("Running benchmarks under mandatory inclusion ...")
+        bench_v = []
+        for V in self.BENCH_V:
+            forced = tuple(order[:V])
+            prop = opt.solve_policy(N, M, forced)
+            K = prop["K"]
+            bench_v.append(dict(
+                V=V, K=K, forced=forced, hr=sum(d.P[i] for i in forced),
+                methods=[("Proposed model", prop),
+                         ("p-median", opt.pmedian(K, M, forced)),
+                         ("Maximal covering", opt.mclp(K, M, forced)),
+                         ("Greedy + 1-swap", opt.greedy(K, M, forced)),
+                         ("Sequential insertion",
+                          opt.sequential(K, M, forced)),
+                         ("Risk-blind optimum",
+                          opt.risk_blind(K, M, forced))]))
+
+        say("Capacity sensitivity ...")
+        capacity = []
+        for C in self.CAPACITIES:
+            row = dict(C=C)
+            for tag, forced in (("s1", HA), ("s2", HB)):
+                t0 = time.time()
+                res_c = opt.solve_policy(N, M, forced, cap=C)
+                res_c["cpu_total"] = time.time() - t0   # incl. q_C
+                row[tag] = res_c
+            capacity.append(row)
+
+        say("Best-effort plans under a hard budget ...")
+        elastic = []
+        for V in self.ELASTIC_V:
+            forced = tuple(order[:V])
+            pol = opt.solve_policy(N, M, forced)
+            el = opt.elastic(N, M, forced)
+            elastic.append(dict(V=V, q=pol["q"], K=pol["K"], Zpol=pol["Z"],
+                                ratepol=pol["rate"], el=el))
 
         rob = self.weight_robustness(R, N, M,
                                      self.risk.landscapes["A"]["X"],
@@ -568,7 +869,9 @@ class Study:
         self.res = dict(N=N, M=M, R=R, SA=SA, SB=SB, HA=HA, HB=HB, s1=s1,
                         s2=s2, crit=crit, cur=cur, keep=keep, vreg=vreg,
                         nsweep=nsweep, msweep=msweep, rsweep=rsweep,
-                        bench=bench, rob=rob, current_plan=tuple(current_plan))
+                        bench=bench, bench_v=bench_v, capacity=capacity,
+                        elastic=elastic, rob=rob,
+                        current_plan=tuple(current_plan))
         say("Done.")
         return self.res
 
@@ -578,14 +881,14 @@ class Study:
         if not r:
             return [], []
 
-        if name == "Table 1":
+        if name == "Table 2":
             rng = ["0-15", "0-70", "1-30", "0.0005-0.015", "10-1000"]
             return (["Code", "Criterion", "Range", "Direction", "Effect"],
                     [[c, n, g, "Benefit" if k == "benefit" else "Cost",
                       "Decreasing" if k == "benefit" else "Increasing"]
                      for (c, n, k), g in zip(RiskModel.CRITERIA, rng)])
 
-        if name == "Table 2":
+        if name == "Table 3":
             s1, s2 = r["s1"], r["s2"]
             codes = sorted(set(s1["centres"]) | set(s2["centres"]),
                            key=lambda j: -d.P[j])
@@ -599,7 +902,7 @@ class Study:
             return (["Code", "Home", "S1 load", "S (A)", "S2 load", "S (B)"],
                     rows)
 
-        if name == "Table 3":
+        if name == "Table 4":
             crit = r["crit"]
             return (["Code", "Home", "Stranded provinces", "Personnel",
                      "Status"],
@@ -608,7 +911,7 @@ class Study:
                       f"{crit[j]['stranded']:,}", crit[j]["status"]]
                      for j in sorted(crit, key=lambda j: -crit[j]["stranded"])])
 
-        if name == "Table 4":
+        if name == "Table 5":
             cur, s1, s2 = r["cur"], r["s1"], r["s2"]
             base = cur["rate"]
             return (["Metric", "Current plan", "Scenario 1", "Scenario 2"], [
@@ -629,7 +932,7 @@ class Study:
                 ["Beyond 250 km", f"{cur['violating_personnel']:,}", "0", "0"],
             ])
 
-        if name == "Table 5":
+        if name == "Table 6":
             return (["V", "q", "K", "Binding driver", "Examined locally",
                      "Rate", "max(N,V) rule"],
                     [[v["V"], v["q"], v["K"], v["driver"], f"{v['Z']:,}",
@@ -637,35 +940,75 @@ class Study:
                       "Feasible" if v["old_feasible"] else "Infeasible"]
                      for v in r["vreg"]])
 
-        if name == "Table 6":
+        if name == "Table 7":
             return (["N", "Examined locally", "Rate", "Personnel-km"],
                     [[x["N"], f"{x['Z']:,}", f"{x['rate']:.2%}",
                       f"{x['pkm']:,}"] for x in r["nsweep"]])
 
-        if name == "Table 7":
+        if name == "Table 8":
             return (["sigma", "I_H unchanged", "S1 set unchanged",
                      "S2 set unchanged", "Z range (S2)"],
                     [[f"{g['sigma']:.2f}", f"{g['hb']:.1%}", f"{g['c1']:.1%}",
                       f"{g['c2']:.1%}", f"{g['z2_min']:,}-{g['z2_max']:,}"]
                      for g in r["rob"]["global_"]])
 
-        if name == "Table 8":
-            b, s1 = r["bench"], r["s1"]
-            return (["Model", "Examined locally", "Rate", "Personnel-km",
-                     "CPU (s)"], [
-                ["Proposed model", f"{s1['Z']:,}", f"{s1['rate']:.2%}",
-                 f"{s1['pkm']:,}", f"{s1['cpu']:.2f}"],
-                ["p-median", f"{b['pmedian']['Z']:,}",
-                 f"{b['pmedian']['rate']:.2%}", f"{b['pmedian']['pkm']:,}",
-                 f"{b['pmedian']['cpu']:.2f}"],
-                ["Maximal covering", f"{b['mclp']['Z']:,}",
-                 f"{b['mclp']['rate']:.2%}", "-", f"{b['mclp']['cpu']:.2f}"],
-                ["Greedy + 1-swap", f"{b['greedy']['Z']:,}",
-                 f"{b['greedy']['rate']:.2%}", "-",
-                 f"{b['greedy']['cpu']:.2f}"],
-            ])
-
         if name == "Table 9":
+            b = r["bench"]
+            rows = []
+            for label, x in (("Proposed model", r["s1"]),
+                             ("p-median", b["pmedian"]),
+                             ("Maximal covering", b["mclp"]),
+                             ("Greedy + 1-swap", b["greedy"])):
+                rows.append([label, f"{x['Z']:,}", f"{x['rate']:.2%}",
+                             f"{x['pkm']:,}", f"{x['maxdist']} km",
+                             f"{x['cpu']:.2f}"])
+            return (["Model", "Examined locally", "Rate", "Personnel-km",
+                     "Longest", "CPU (s)"], rows)
+
+        if name == "Table 10":
+            rows = []
+            for blk in r["bench_v"]:
+                for label, x in blk["methods"]:
+                    head = f"V={blk['V']}, K={blk['K']}"
+                    if x is None or not x.get("feasible", True):
+                        rows.append([head, label, "no K-center cover found",
+                                     "", "", "", "", ""])
+                        continue
+                    rows.append([head, label, f"{x['Z']:,}",
+                                 f"{x['rate']:.2%}", f"{x['pkm']:,}",
+                                 f"{x['maxdist']} km", f"{x['hr_travel']:,}",
+                                 f"{x['cpu']:.2f}"])
+            return (["Instance", "Model", "Examined locally", "Rate",
+                     "Personnel-km", "Longest", "High-risk travelling",
+                     "CPU (s)"], rows)
+
+        if name == "Table 11":
+            rows = []
+            for c in r["capacity"]:
+                cells = ["none" if c["C"] is None else f"{c['C']:,}"]
+                for tag in ("s1", "s2"):
+                    x = c[tag]
+                    cells += [x["q"], f"{x['Z']:,}", f"{x['pkm']:,}",
+                              f"{max(x['load'].values()):,}"]
+                rows.append(cells)
+            return (["Capacity C", "q_C (S1)", "Local (S1)", "Pers.-km (S1)",
+                     "Max load (S1)", "q_C (S2)", "Local (S2)",
+                     "Pers.-km (S2)", "Max load (S2)"], rows)
+
+        if name == "Table 12":
+            rows = []
+            for e in r["elastic"]:
+                el = e["el"]
+                rows.append([e["V"], e["q"], e["K"], f"{e['Zpol']:,}",
+                             f"{el['Z']:,}", f"{el['violating_personnel']:,}",
+                             len(el["violations"]),
+                             f"{el['maxdist']} km", f"{el['excess_pkm']:,}"])
+            return (["V", "q", "K by (10)", "Local at K",
+                     "Local at N (best effort)", "Personnel beyond M",
+                     "Provinces beyond M", "Longest", "Excess personnel-km"],
+                    rows)
+
+        if name == "Table 13":
             A = self.risk.landscapes["A"]
             rows = [[p] + [f"{A['V'][p-1, c]:.5f}" for c in range(5)] +
                     [f"{A['dp'][p-1]:.5f}", f"{A['dn'][p-1]:.5f}",
@@ -702,27 +1045,29 @@ class Study:
 
     def _f_arch(self, fig):
         from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
-        fig.set_size_inches(6.95, 2.05)
+        fig.set_size_inches(6.95, 2.25)
         ax = fig.subplots()
         ax.set_xlim(0, 100)
-        ax.set_ylim(0, 34)
+        ax.set_ylim(-4, 34)
         ax.axis("off")
         spec = [
-            (0.8, "DATA LAYER", ["Personnel counts", "Distance matrix",
+            (0.8, "DATA LAYER", ["Personnel counts $P_i$",
+                                 "Distance matrix $d_{ij}$",
                                  "Security indicators", "Consistency checks"],
              "#eef2f6", ACC),
-            (20.6, "RISK ENGINE", ["TOPSIS with policy", "weights w",
-                                   "Risk scores", "Mandatory set"],
+            (20.6, "RISK ENGINE", ["TOPSIS with policy", "weights $w$",
+                                   "Risk scores $S_i$", "Mandatory set $I_H$"],
              "#fdeeee", ALERT),
-            (40.4, "OPTIMIZATION CORE", ["Set covering (9)",
+            (40.4, "OPTIMIZATION CORE", ["Covering minimum $q$ (9)",
                                          "Cardinality rule (10)",
-                                         "Integer program", "(1)-(7)"],
+                                         "Model (1)\u2013(7), (15)",
+                                         "Capacity, elastic (16)\u2013(19)"],
              "#eef6ef", GOOD),
             (60.2, "ANALYSIS", ["Coverage criticality", "Current-plan audit",
-                                "Threshold sweeps", "Weight robustness"],
+                                "Sweeps and robustness", "Benchmarks"],
              "#eef2f6", ACC),
             (80.0, "USER INTERFACE", ["Scenario control", "Tables and figures",
-                                      "What-if solver", "Export"],
+                                      "What-if solver", "Export and reporting"],
              "#f4f6f8", MUTED),
         ]
         for x, title, lines, fc, ec in spec:
@@ -734,11 +1079,21 @@ class Study:
                     fontweight="bold", color=ec)
             for k, t in enumerate(lines):
                 ax.text(x + 8.8, 22.5 - 4.1 * k, t, ha="center", va="top",
-                        fontsize=6.4, color=INK)
+                        fontsize=6.3, color=INK)
         for a, b in zip(spec[:-1], spec[1:]):
             ax.add_patch(FancyArrowPatch((a[0] + 17.6, 18.5), (b[0], 18.5),
                                          arrowstyle="-|>", mutation_scale=9,
                                          lw=1.0, color=MUTED))
+        # scenario feedback loop: interface back to the risk engine
+        x_ui, x_risk = 80.0 + 8.8, 20.6 + 8.8
+        ax.plot([x_ui, x_ui, x_risk], [6.6, 2.0, 2.0], ls="--", lw=1.0,
+                color=MUTED)
+        ax.add_patch(FancyArrowPatch((x_risk, 2.0), (x_risk, 6.6),
+                                     arrowstyle="-|>", mutation_scale=9,
+                                     lw=1.0, color=MUTED))
+        ax.text((x_ui + x_risk) / 2, 0.6, "scenario feedback: revised "
+                "weights, thresholds and mandatory sets", ha="center",
+                va="top", fontsize=6.2, style="italic", color=MUTED)
         fig.tight_layout(pad=0.2)
 
     def _panel(self, ax, res, title, forced=()):
@@ -782,11 +1137,12 @@ class Study:
         fig.set_size_inches(6.95, 5.6)
         a1, a2 = fig.subplots(2, 1)
         s1, s2 = r["s1"], r["s2"]
-        self._panel(a1, s1, f"(a) Scenario 1 - V=0, K={s1['K']}: "
-                            f"{s1['Z']:,} examined locally ({s1['rate']:.2%})")
-        self._panel(a2, s2, f"(b) Scenario 2 - V={s2['V']}, K={s2['K']}: "
-                            f"{s2['Z']:,} examined locally ({s2['rate']:.2%})",
-                    forced=r["HB"])
+        self._panel(a1, s1, f"(a) Scenario 1 \u2014 $V={s1['V']}$, "
+                            f"$K={s1['K']}$: {s1['Z']:,} examined locally "
+                            f"({s1['rate']:.2%})")
+        self._panel(a2, s2, f"(b) Scenario 2 \u2014 $V={s2['V']}$, "
+                            f"$K={s2['K']}$: {s2['Z']:,} examined locally "
+                            f"({s2['rate']:.2%})", forced=r["HB"])
         leg = [Line2D([], [], marker="o", ls="", mfc=ACC, mec="w", ms=6,
                       label="Selected examination center"),
                Line2D([], [], marker="s", ls="", mfc=ALERT, mec="w", ms=6,
@@ -794,7 +1150,7 @@ class Study:
                Line2D([], [], marker="o", ls="", mfc="white", mec=MUTED, ms=5,
                       label="Province assigned to a center"),
                Line2D([], [], color="#9fb6cc", lw=1,
-                      label="Assignment (<= 250 km)")]
+                      label=f"Assignment (\u2264 {r['M']} km)")]
         fig.legend(handles=leg, loc="lower center", ncol=4, frameon=False,
                    fontsize=7)
         fig.tight_layout(rect=[0, .045, 1, 1])
@@ -803,25 +1159,43 @@ class Study:
         r = self.res
         fig.set_size_inches(6.95, 2.7)
         a1, a2 = fig.subplots(1, 2)
-        V = [v["V"] for v in r["vreg"]]
+        vr = r["vreg"]
+        V = [v["V"] for v in vr]
+        K = [v["K"] for v in vr]
+        a1.fill_between(V, [r["N"]] * len(V), K, color=ACC, alpha=.08, lw=0)
         a1.plot(V, [r["N"]] * len(V), "-", color=MUTED, lw=1.1,
-                label=f"budget N={r['N']}")
-        a1.plot(V, V, ":", color=ALERT, lw=1.3, label="risk V")
-        a1.plot(V, [v["q"] for v in r["vreg"]], "--", color=GOOD, lw=1.3,
-                label="coverage q")
-        a1.plot(V, [v["K"] for v in r["vreg"]], "o-", color=ACC, ms=4, lw=1.7,
-                label="realized K")
-        for v in r["vreg"]:
-            if not v["old_feasible"]:
-                a1.plot(v["V"], v["K"], "x", color=ALERT, ms=6, mew=1.5)
-        a1.set_xlabel("Mandatory high-risk provinces, V")
+                label=f"budget $N={r['N']}$")
+        a1.plot(V, V, ":", color=ALERT, lw=1.3, label="risk $V$")
+        a1.plot(V, [v["q"] for v in vr], "--", color=GOOD, lw=1.3,
+                label="coverage $q(M, I_H)$")
+        a1.plot(V, K, "o-", color=ACC, ms=4, lw=1.7,
+                label="realized $K=\\max(N, V, q)$")
+        bad = [v for v in vr if not v["old_feasible"]]
+        a1.plot([v["V"] for v in bad], [v["K"] for v in bad], "x",
+                color=ALERT, ms=6, mew=1.5, ls="",
+                label="$K=\\max(N, V)$ infeasible")
+        a1.set_xlabel("Mandatory high-risk provinces, $V$")
         a1.set_ylabel("Number of examination centers")
         a1.set_title("(a) Which force sets the center count", fontsize=8.5)
-        a1.legend(fontsize=6.4, frameon=False, loc="upper left")
+        a1.legend(fontsize=6.2, frameon=False, loc="upper left")
         a1.grid(alpha=.25, lw=.5)
-        a2.plot(V, [100 * v["rate"] for v in r["vreg"]], "o-", color=ACC,
+        # shade the budget-driven and coverage-driven regimes
+        last_b = max(v["V"] for v in vr if v["K"] == r["N"])
+        first_c = min((v["V"] for v in vr if v["K"] > r["N"]),
+                      default=V[-1])
+        cut = (last_b + first_c) / 2
+        a2.axvspan(V[0] - 0.5, cut, color=MUTED, alpha=.10, lw=0)
+        a2.axvspan(cut, V[-1] + 0.5, color=GOOD, alpha=.10, lw=0)
+        a2.axvline(cut, color=MUTED, lw=.6, alpha=.6)
+        a2.plot(V, [100 * v["rate"] for v in vr], "o-", color=ACC,
                 ms=4, lw=1.6)
-        a2.set_xlabel("Mandatory high-risk provinces, V")
+        a2.set_xlim(V[0] - 0.5, V[-1] + 0.5)
+        a2.set_ylim(30, 56)
+        a2.text(cut / 2, 52.5, "budget-driven\n$K=N$", ha="center",
+                va="center", fontsize=6.4, color=MUTED)
+        a2.text((cut + V[-1]) / 2, 52.5, "coverage-driven\n$K=q>N$",
+                ha="center", va="center", fontsize=6.4, color=GOOD)
+        a2.set_xlabel("Mandatory high-risk provinces, $V$")
         a2.set_ylabel("Local examination rate (%)")
         a2.set_title("(b) Cost of binding security", fontsize=8.5)
         a2.grid(alpha=.25, lw=.5)
@@ -831,16 +1205,34 @@ class Study:
         r, d = self.res, self.d
         fig.set_size_inches(6.95, 2.7)
         ax = fig.subplots()
-        N = [x["N"] for x in r["nsweep"]]
-        ax.plot(N, [100 * x["rate"] for x in r["nsweep"]], "o-", color=ACC,
-                ms=3.6, lw=1.4)
-        ax.set_xlabel("Number of examination centers, N")
+        ns = r["nsweep"]
+        N = [x["N"] for x in ns]
+        rates = [100 * x["rate"] for x in ns]
+        ax.plot(N, rates, "o-", color=ACC, ms=3.6, lw=1.4)
+        ax.set_xlabel("Number of examination centers, $N$")
         ax.set_ylabel("Local examination rate (%)", color=ACC)
         ax.tick_params(axis="y", labelcolor=ACC)
+        ax.set_xticks(N[::2])
         ax.axvline(r["N"], color=ALERT, ls="--", lw=.9)
-        ax.axhline(100 * r["cur"]["rate"], color=MUTED, ls=":", lw=.9)
+        cur = 100 * r["cur"]["rate"]
+        ax.axhline(cur, color=MUTED, ls=":", lw=.9)
+        ax.text(N[0] + 1.6, cur + 0.6,
+                f"current plan ({r['cur']['rate']:.2%}, infeasible at "
+                f"{r['M']} km)", fontsize=6.2, color="#4a5a6a", va="bottom")
+        q0 = N[0]
+        ax.axvline(q0, color=GOOD, ls="-.", lw=.9)
+        ax.annotate(f"$q={q0}$: minimum for\nfull {r['M']}-km coverage",
+                    xy=(q0, rates[0] + 7), xytext=(q0 + 1.8, rates[0] + 4),
+                    fontsize=6.2, color=GOOD,
+                    arrowprops=dict(arrowstyle="->", color=GOOD, lw=.7))
+        k = N.index(r["N"])
+        ax.annotate(f"current configuration ($N={r['N']}$)",
+                    xy=(r["N"], rates[0] + 13 - 13), xytext=(r["N"] + 3.5,
+                                                             rates[0] + 1),
+                    fontsize=6.2, color=ALERT,
+                    arrowprops=dict(arrowstyle="->", color=ALERT, lw=.7))
         ax2 = ax.twinx()
-        ax2.plot(N, [x["pkm"] / 1e6 for x in r["nsweep"]], "s--",
+        ax2.plot(N, [x["pkm"] / 1e6 for x in ns], "s--",
                  color="#e07b00", ms=3.2, lw=1.2)
         ax2.set_ylabel("Total travel (million personnel-km)", color="#e07b00")
         ax2.tick_params(axis="y", labelcolor="#e07b00")
@@ -855,12 +1247,13 @@ class Study:
         a1.plot([x["M"] for x in ms], [100 * x["rate"] for x in ms], "o-",
                 color=ACC, ms=3.8, lw=1.4)
         for x in ms:
-            a1.annotate(f"q={x['q']}", (x["M"], 100 * x["rate"]),
+            a1.annotate(f"$q={x['q']}$", (x["M"], 100 * x["rate"]),
                         textcoords="offset points", xytext=(0, -11),
                         fontsize=6.0, ha="center", color=GOOD)
-        a1.set_xlabel("Maximum travel distance, M (km)")
+        a1.set_xlabel("Maximum travel distance, $M$ (km)")
         a1.set_ylabel("Local examination rate (%)")
-        a1.set_title(f"(a) Accessibility threshold, N={r['N']}", fontsize=8.5)
+        a1.set_title(f"(a) Accessibility threshold, $N={r['N']}$",
+                     fontsize=8.5)
         a1.grid(alpha=.25, lw=.5)
         R = [x["R"] for x in r["rsweep"]]
         a2.plot(R, [100 * x["rate"] for x in r["rsweep"]], "o-", color=ALERT,
@@ -868,9 +1261,9 @@ class Study:
         a2b = a2.twinx()
         a2b.step(R, [x["V"] for x in r["rsweep"]], where="mid", color=GOOD,
                  lw=1.2, ls="--")
-        a2b.set_ylabel("Mandatory provinces V", color=GOOD)
+        a2b.set_ylabel("Mandatory provinces $V$", color=GOOD)
         a2b.tick_params(axis="y", labelcolor=GOOD)
-        a2.set_xlabel("Risk-classification threshold, R")
+        a2.set_xlabel("Risk-classification threshold, $R$")
         a2.set_ylabel("Local examination rate (%)", color=ALERT)
         a2.tick_params(axis="y", labelcolor=ALERT)
         a2.set_title("(b) Risk threshold, Landscape B", fontsize=8.5)
@@ -886,11 +1279,16 @@ class Study:
         ax.plot(range(len(SA)), SA[order], "o-", color=ACC, ms=2.6, lw=1.0,
                 label="Landscape A (baseline)")
         ax.plot(range(len(SB)), SB[order], "s-", color=ALERT, ms=2.6, lw=1.0,
-                alpha=.85, label="Landscape B")
+                alpha=.85, label="Landscape B (two provinces deteriorate)")
         ax.axhline(r["R"], color=GOOD, ls="--", lw=1.0)
+        ax.text(1, r["R"] + 0.015, f"$R={r['R']}$ mandatory-inclusion "
+                "threshold", fontsize=6.2, color=GOOD, va="bottom")
         ax.axhline(RiskModel.LOW_CUT, color=MUTED, ls=":", lw=.9)
+        ax.text(1, RiskModel.LOW_CUT + 0.015, "Low / Medium boundary "
+                f"({RiskModel.LOW_CUT})", fontsize=6.2, color="#4a5a6a",
+                va="bottom")
         ax.set_xlabel("Provinces, ordered by Landscape A risk score")
-        ax.set_ylabel("Risk score")
+        ax.set_ylabel("Risk score $S_i$")
         ax.legend(fontsize=6.8, frameon=False, loc="upper right")
         ax.grid(alpha=.25, lw=.5)
         fig.tight_layout()
@@ -902,17 +1300,18 @@ class Study:
         g = r["rob"]["global_"]
         sig = [x["sigma"] for x in g]
         a1.plot(sig, [100 * x["hb"] for x in g], "o-", color=ALERT, ms=4,
-                lw=1.5, label="mandatory set unchanged")
+                lw=1.5, label="mandatory set $I_H=\\{30, 62\\}$ unchanged")
         a1.plot(sig, [100 * x["c2"] for x in g], "s-", color=ACC, ms=4, lw=1.5,
-                label="Scenario 2 set unchanged")
+                label="Scenario 2 center set unchanged")
         a1.plot(sig, [100 * x["c1"] for x in g], "^--", color=MUTED, ms=4,
-                lw=1.3, label="Scenario 1 set unchanged")
-        a1.set_xlabel("Perturbation dispersion")
-        a1.set_ylabel("Share of draws (%)")
+                lw=1.3, label="Scenario 1 center set unchanged")
+        a1.set_xlabel("Perturbation dispersion $\\sigma$")
+        a1.set_ylabel(f"Share of {g[0]['n']} draws (%)")
         a1.set_ylim(60, 102)
         a1.set_xticks(sig)
         a1.legend(fontsize=6.2, frameon=False, loc="lower left")
-        a1.set_title("(a) Stability under random perturbation", fontsize=8.5)
+        a1.set_title("(a) Stability under random weight perturbation",
+                     fontsize=8.5)
         a1.grid(alpha=.25, lw=.5)
         crits = [f"C{k+1}" for k in range(5)]
         for k, f in enumerate((0.5, 0.75, 1.25, 1.5)):
@@ -920,9 +1319,12 @@ class Study:
                          if o["crit"] == c and abs(o["factor"] - f) < 1e-9)
                     for c in crits]
             a2.bar(np.arange(5) + (k - 1.5) * 0.2, [v / 1000 for v in vals],
-                   0.2, label=f"x{f}",
+                   0.2, label=f"\u00d7{f}",
                    color=["#9db8d2", "#6f95bb", ACC, "#12314c"][k])
         a2.axhline(r["rob"]["base_Z1"] / 1000, color=ALERT, ls="--", lw=1.0)
+        a2.text(4.45, r["rob"]["base_Z1"] / 1000 + 0.08,
+                f"baseline {r['rob']['base_Z1']:,}", ha="right",
+                va="bottom", fontsize=6.2, color=ALERT)
         a2.set_xticks(range(5))
         a2.set_xticklabels(crits)
         a2.set_ylim(17.4, 20.9)
@@ -1020,6 +1422,45 @@ class Study:
           f"Scenario 2 set unchanged in {same}")
         A("")
         A("-" * 74)
+        A(" BENCHMARKS (same K, M and mandatory set for every model)")
+        A("-" * 74)
+        b = r["bench"]
+        A(f" V=0: LP relaxation bound {b['lp']:,.1f} vs integer optimum "
+          f"{s1['Z']:,}; greedy coverage checks {b['greedy']['checks']:,}")
+        for blk in r["bench_v"]:
+            A(f" V={blk['V']} K={blk['K']} mandatory {list(blk['forced'])}"
+              f" ({blk['hr']:,} personnel)")
+            for label, x in blk["methods"]:
+                if x is None or not x.get("feasible", True):
+                    A(f"   {label:<22} no K-center cover found")
+                else:
+                    A(f"   {label:<22} local {x['Z']:>6,} ({x['rate']:.2%})"
+                      f"  travel {x['pkm']:>9,}  high-risk travelling "
+                      f"{x['hr_travel']:>5,}")
+        A("")
+        A("-" * 74)
+        A(" CAPACITY SENSITIVITY (uniform capacity C per center)")
+        A("-" * 74)
+        for c in r["capacity"]:
+            cap = "none" if c["C"] is None else f"{c['C']:,}"
+            A(f" C={cap:>6}: " + "   ".join(
+                f"{tag.upper()} q_C={c[tag]['q']} K={c[tag]['K']} "
+                f"local {c[tag]['Z']:,} travel {c[tag]['pkm']:,} "
+                f"max load {max(c[tag]['load'].values()):,}"
+                for tag in ("s1", "s2")))
+        A("")
+        A("-" * 74)
+        A(f" BEST-EFFORT PLANS WITH THE BUDGET HELD AT N={r['N']}")
+        A("-" * 74)
+        for e in r["elastic"]:
+            el = e["el"]
+            A(f" V={e['V']:>2} q={e['q']:>2}: rule (10) K={e['K']} local "
+              f"{e['Zpol']:,} | best effort at N: local {el['Z']:,}, "
+              f"{el['violating_personnel']:,} personnel in "
+              f"{len(el['violations'])} provinces beyond M, longest "
+              f"{el['maxdist']} km")
+        A("")
+        A("-" * 74)
         A(" PROPOSITION 1 CHECK")
         A("-" * 74)
         A(f" q >= V in every tested instance: "
@@ -1034,7 +1475,7 @@ class Study:
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
-class App(tk.Tk):
+class App(_TkBase):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
@@ -1436,6 +1877,9 @@ def main():
         print(study.summary())
         return
 
+    if tk is None:
+        sys.exit("Tkinter is not installed. Install python3-tk for the GUI, "
+                 "or use --cli for text output.")
     try:
         App().mainloop()
     except tk.TclError as exc:

@@ -13,7 +13,9 @@ which the number of centers is governed by a coverage requirement rather than
 by the budget alone.
 
 The application solves the model on the institutional data, runs every analysis
-reported in the article, and regenerates all nine tables and all seven figures.
+reported in the article, and regenerates every computed table (Tables II–XIII)
+and all seven figures. Table I of the article is a literature comparison and is
+not computed.
 
 ---
 
@@ -43,6 +45,24 @@ solution of (9), `q ≥ V` always holds. Hence `K = max{N, q}` and the mandatory
 count `V` never binds on its own. A rule of the form `K = max(N, V)` becomes
 infeasible once the mandatory set grows and clusters geographically.
 
+### Solution procedure and extensions (Section III-G)
+
+```
+(15) min Σ_i Σ_j P_i d_ij y_ij   s.t. (2)–(7), Σ_i P_i y_ii = Z*     travel stage
+(16) Σ_i P_i y_ij ≤ C_j x_j                                          capacity
+(17) Σ_j y_ij = 1, y_ij ≤ x_j  (all pairs)                           elastic assignment
+(18) u_i ≥ Σ_j (d_ij − M)^+ y_ij,  u_i ≥ 0                           penalty variables
+(19) max Σ_i P_i y_ii − λ Σ_i P_i u_i,  λ > Σ_i P_i                  best-effort objective
+```
+
+* `Optimizer.solve(K, M, forced, cap=...)` adds the capacity constraint (16);
+  `cap` is a number (uniform) or a dict {province: capacity}.
+  `Optimizer.covering_minimum(M, forced, cap=...)` returns the capacitated
+  covering minimum `q_C`, and `solve_policy` applies `K = max{N, q_C}`.
+* `Optimizer.elastic(K, M, forced)` returns the least-violating plan with
+  exactly `K` centers. (19) is solved as the equivalent lexicographic sequence
+  (excess personnel-km, then home cohort, then travel).
+
 ---
 
 ## Installation
@@ -53,7 +73,11 @@ cd ecs-dss
 pip install -r requirements.txt
 ```
 
-On Debian or Ubuntu the Tk bindings are a separate package:
+PuLP is pinned to the 2.x series, with which the published results were
+produced (the bundled CBC 2.10.3 solver is used).
+
+The graphical interface needs Tk. On Debian or Ubuntu the Tk bindings are a
+separate package (not needed for `--cli`):
 
 ```bash
 sudo apt install python3-tk
@@ -80,7 +104,7 @@ python ecs_dss.py --cli
 | Tab | Contents |
 |---|---|
 | Summary | Every numerical result, including the Proposition 1 check |
-| Tables | Tables 1–9 and the full 81-province risk table, exportable as CSV |
+| Tables | Tables II–XIII and the full 81-province risk table, exportable as CSV |
 | Figures | Figures 1–7, exportable at 600 dpi |
 | What-if solver | Force any set of provinces open and re-solve |
 
@@ -141,9 +165,15 @@ Expected headline figures:
 | Same-day rule violation, current plan | 1,488 personnel in 5 provinces, longest 314 km |
 | Coverage-critical centers | 14 of 17; redundant {12, 47, 73} |
 | Rule `K = max(N, V)` | infeasible from V = 10 onward |
+| Benchmark, V = 2 (Table X) | proposed 18,916; p-median 16,403; MCLP 10,854; greedy 17,517 |
+| Sequential insertion (Table X) | no feasible plan with K centers for V = 5, 8, 10 |
+| Capacity C = 3,500 (Table XI) | Scenario 1: 19,574 local; Scenario 2: 18,435 local |
+| Best effort, V = 10, N = 17 (Table XII) | 215 personnel of province 57 at 254 km |
 
-Solving takes well under a second per instance with CBC; the full study,
-including the 1,500-draw robustness analysis, takes a few minutes.
+Each instance of the main model closes at the root node in well under a
+second; the full study, including the 1,500-draw robustness analysis, the
+benchmarks, the capacity sweep and the best-effort plans, takes about a minute.
+CPU times vary slightly between machines and runs.
 
 ---
 
@@ -153,7 +183,8 @@ including the 1,500-draw robustness analysis, takes a few minutes.
 ecs_dss.py          single-file application
   ProblemData       data loading and validation
   RiskModel         TOPSIS risk scores under the policy weights
-  Optimizer         covering minimum, main model, diagnostics, benchmarks
+  Optimizer         covering minimum, main model, travel stage, capacity,
+                    best-effort model, diagnostics, benchmarks
   Study             full experimental protocol, tables, figures, summary
   App               Tkinter interface
 data.json           personnel counts and distance matrix
